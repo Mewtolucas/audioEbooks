@@ -26,8 +26,7 @@ cp "$SCRIPT_DIR/requirements.txt" "$RESOURCES/"
 # ── Write the launcher executable ─────────────────────────────────────────────
 cat > "$MACOS/$APP_NAME" <<'LAUNCHER'
 #!/usr/bin/env bash
-# This script runs inside the .app bundle.
-BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/..'" && pwd)"
 RESOURCES="$BUNDLE/Resources"
 VENV="$RESOURCES/.venv"
 

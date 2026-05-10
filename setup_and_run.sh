@@ -13,7 +13,6 @@ PYTHON=""
 find_python() {
     for candidate in python3 python3.12 python3.11 python3.10 python3.9; do
         if command -v "$candidate" &>/dev/null; then
-            ver=$("$candidate" -c 'import sys; print(sys.version_info[:2])' 2>/dev/null)
             if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>/dev/null; then
                 PYTHON="$candidate"
                 return 0

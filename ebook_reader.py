@@ -55,7 +55,7 @@ DARK = {
 }
 
 
-# ── OCR Engine (Apple Vision) ─────────────────────────────────────────────────
+# ── OCR Engine (Apple Vision) ─────────────────────────────────────────────
 
 class OCREngine:
     """
@@ -100,7 +100,7 @@ class OCREngine:
         return "\n".join(lines)
 
 
-# ── TTS Engine (NSSpeechSynthesizer / say fallback) ───────────────────────────
+# ── TTS Engine (NSSpeechSynthesizer / say fallback) ──────────────────────────────
 
 class TTSEngine:
     """
@@ -186,7 +186,7 @@ class TTSEngine:
         return self._synth is not None
 
 
-# ── Main application ──────────────────────────────────────────────────────────
+# ── Main application ─────────────────────────────────────────────────────────────
 
 class EbookReader:
     def __init__(self, root):
@@ -215,7 +215,7 @@ class EbookReader:
         self._apply_theme()
         self._show_welcome()
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    # ── UI construction ───────────────────────────────────────────────
 
     def _build_ui(self):
         self._build_menu()
@@ -253,11 +253,11 @@ class EbookReader:
 
         # Navigation / display controls
         self.open_btn  = btn("Open Book",  self.open_file)
-        self.prev_btn  = btn("◀ Prev",     self.prev_chapter)
-        self.next_btn  = btn("Next ▶",     self.next_chapter)
+        self.prev_btn  = btn("◄ Prev",     self.prev_chapter)
+        self.next_btn  = btn("Next ►",     self.next_chapter)
         self.fdec_btn  = btn("A−",          self.decrease_font, 11)
         self.finc_btn  = btn("A+",          self.increase_font, 14)
-        self.dark_btn  = btn("☾ Dark",     self.toggle_dark_mode)
+        self.dark_btn  = btn("☮ Dark",     self.toggle_dark_mode)
 
         for w in (self.open_btn, self.prev_btn, self.next_btn,
                   self.fdec_btn, self.finc_btn, self.dark_btn):
@@ -299,7 +299,7 @@ class EbookReader:
         self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         self.paned.pack(fill=tk.BOTH, expand=True)
 
-        # ── Left: TOC ──────────────────────────────────────────────────────
+        # ── Left: TOC ──────────────────────────────────────────────
         self.left_frame = tk.Frame(self.paned, width=230)
         self.paned.add(self.left_frame, weight=0)
 
@@ -323,7 +323,7 @@ class EbookReader:
         toc_sb.config(command=self.toc_listbox.yview)
         self.toc_listbox.bind("<<ListboxSelect>>", self._on_toc_select)
 
-        # ── Right: Reading area ────────────────────────────────────────────
+        # ── Right: Reading area ──────────────────────────────────────────
         self.right_frame = tk.Frame(self.paned)
         self.paned.add(self.right_frame, weight=1)
 
@@ -353,7 +353,7 @@ class EbookReader:
         self.root.bind("<Command-d>", lambda _: self.toggle_dark_mode())
         self.root.bind("<Command-r>", lambda _: self._tts_play())
 
-    # ── Theme ─────────────────────────────────────────────────────────────────
+    # ── Theme ─────────────────────────────────────────────────────────────────────
 
     def _apply_theme(self):
         t = DARK if self.dark_mode else LIGHT
@@ -388,7 +388,7 @@ class EbookReader:
         )
 
         self._configure_text_tags()
-        self.dark_btn.config(text="☀ Light" if self.dark_mode else "☾ Dark")
+        self.dark_btn.config(text="☀ Light" if self.dark_mode else "☮ Dark")
 
     def _configure_text_tags(self):
         fs = self.font_size
@@ -405,7 +405,7 @@ class EbookReader:
         self.text_area.tag_configure("scanning", font=("Helvetica", fs - 2, "italic"),
                                       foreground=t["ocr_fg"])
 
-    # ── File opening ──────────────────────────────────────────────────────────
+    # ── File opening ───────────────────────────────────────────────────
 
     def open_file(self):
         if not EPUB_SUPPORT and not PDF_SUPPORT:
@@ -442,7 +442,7 @@ class EbookReader:
         except Exception as exc:
             messagebox.showerror("Error opening file", str(exc))
 
-    # ── EPUB loading ──────────────────────────────────────────────────────────
+    # ── EPUB loading ──────────────────────────────────────────────────
 
     def _load_epub(self, path):
         self._tts.stop()
@@ -479,7 +479,7 @@ class EbookReader:
         self.show_chapter(0)
         self._tts_set_state("idle")
 
-    # ── PDF loading ───────────────────────────────────────────────────────────
+    # ── PDF loading ───────────────────────────────────────────────────
 
     def _load_pdf(self, path):
         self._tts.stop()
@@ -511,7 +511,7 @@ class EbookReader:
         self.show_chapter(0)
         self._tts_set_state("idle")
 
-    # ── Chapter display ───────────────────────────────────────────────────────
+    # ── Chapter display ───────────────────────────────────────────────────
 
     def _populate_toc(self):
         self.toc_listbox.delete(0, tk.END)
@@ -552,7 +552,7 @@ class EbookReader:
             self.text_area.yview_moveto(0)
             self._render_pdf_async(data, render_id)
 
-    # ── EPUB rendering ────────────────────────────────────────────────────────
+    # ── EPUB rendering ────────────────────────────────────────────────────
 
     def _render_epub(self, html):
         soup = BeautifulSoup(html, "html.parser")
@@ -661,7 +661,7 @@ class EbookReader:
         end = self.text_area.index(tk.INSERT)
         self.text_area.tag_add(tag_name, start, end)
 
-    # ── PDF rendering (with background OCR) ──────────────────────────────────
+    # ── PDF rendering (with background OCR) ────────────────────────────────────
 
     def _render_pdf_async(self, page_range, render_id):
         start, end = page_range
@@ -747,7 +747,7 @@ class EbookReader:
 
         self.text_area.config(state=tk.DISABLED)
 
-    # ── OCR status ────────────────────────────────────────────────────────────
+    # ── OCR status ─────────────────────────────────────────────────────────────
 
     def _set_ocr_status(self, message: str):
         self.ocr_status_label.config(text=message)
@@ -818,7 +818,7 @@ class EbookReader:
         else:
             self._tts_poll_id = self.root.after(300, self._tts_poll)
 
-    # ── Navigation controls ───────────────────────────────────────────────────
+    # ── Navigation controls ───────────────────────────────────────────────
 
     def _on_toc_select(self, _event):
         sel = self.toc_listbox.curselection()
@@ -851,7 +851,7 @@ class EbookReader:
         self.dark_mode = not self.dark_mode
         self._apply_theme()
 
-    # ── Welcome screen ────────────────────────────────────────────────────────
+    # ── Welcome screen ──────────────────────────────────────────────────────
 
     def _show_welcome(self):
         self.text_area.config(state=tk.NORMAL)
@@ -884,13 +884,13 @@ Getting started
   2.  Navigate chapters via the Table of Contents on the left.
   3.  Press ⌘R or click ▶ Speak to listen to the chapter.
   4.  Use A− / A+ (or ⌘= / ⌘−) to adjust font size.
-  5.  Toggle dark mode with ☾ (or ⌘D).
+  5.  Toggle dark mode with ☮ (or ⌘D).
 """)
         self.text_area.config(state=tk.DISABLED)
         self._tts_set_state("no_book")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────────────
 
 def main():
     root = tk.Tk()
