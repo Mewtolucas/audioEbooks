@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import io
 import os
+import re
 import sys
 import threading
 
@@ -61,7 +62,7 @@ class OCREngine:
     Wraps Apple Vision text recognition (macOS 10.15+).
     Falls back gracefully when pyobjc is not installed.
     """
-    _available = None  # None = untested, True/False = result
+    _available = None
 
     @classmethod
     def available(cls) -> bool:
@@ -76,7 +77,6 @@ class OCREngine:
 
     @classmethod
     def recognize(cls, pil_image) -> str:
-        """Run OCR on a PIL Image and return the recognized text."""
         import Vision
         import objc
 
@@ -100,7 +100,93 @@ class OCREngine:
         return "\n".join(lines)
 
 
-# ── Colour themes ─────────────────────────────────────────────────────────────
+# ── TTS Engine (NSSpeechSynthesizer / say fallback) ───────────────────────────
+
+class TTSEngine:
+    """
+    Text-to-speech using NSSpeechSynthesizer (via pyobjc) on macOS.
+    Falls back to subprocess 'say' when pyobjc/AppKit is unavailable.
+    Pause/resume only work in the NSSpeechSynthesizer path.
+    """
+    _available = None
+
+    @classmethod
+    def available(cls) -> bool:
+        if cls._available is None:
+            try:
+                from AppKit import NSSpeechSynthesizer  # noqa: F401
+                cls._available = True
+            except ImportError:
+                cls._available = False
+        return cls._available
+
+    @classmethod
+    def best_voice(cls):
+        """Return the identifier for the best available English voice."""
+        if not cls.available():
+            return None
+        from AppKit import NSSpeechSynthesizer
+        premium, enhanced, standard = [], [], []
+        for v in NSSpeechSynthesizer.availableVoices():
+            attrs = NSSpeechSynthesizer.attributesForVoice_(v) or {}
+            if not str(attrs.get("VoiceLocaleIdentifier", "")).startswith("en"):
+                continue
+            q = attrs.get("VoiceQuality", 0)
+            (premium if q >= 3 else enhanced if q == 2 else standard).append(v)
+        candidates = premium or enhanced or standard
+        return candidates[0] if candidates else None
+
+    def __init__(self):
+        self._synth   = None
+        self._proc    = None
+        self._paused  = False
+        if self.available():
+            from AppKit import NSSpeechSynthesizer
+            self._synth = NSSpeechSynthesizer.alloc().initWithVoice_(self.best_voice())
+
+    def speak(self, text: str) -> None:
+        self.stop()
+        self._paused = False
+        if self._synth is not None:
+            self._synth.startSpeakingString_(text)
+        else:
+            import subprocess
+            self._proc = subprocess.Popen(["say", text])
+
+    def pause(self) -> None:
+        if self._synth and self._synth.isSpeaking():
+            self._synth.pauseSpeakingAtBoundary_(0)  # 0 = NSSpeechWordBoundary
+            self._paused = True
+
+    def resume(self) -> None:
+        if self._synth and self._paused:
+            self._synth.continueSpeaking()
+            self._paused = False
+
+    def stop(self) -> None:
+        self._paused = False
+        if self._synth:
+            self._synth.stopSpeaking()
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
+
+    @property
+    def is_speaking(self) -> bool:
+        if self._synth:
+            return bool(self._synth.isSpeaking()) and not self._paused
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def supports_pause(self) -> bool:
+        return self._synth is not None
+
+
+# ── Main application ──────────────────────────────────────────────────────────
 
 class EbookReader:
     def __init__(self, root):
@@ -118,7 +204,12 @@ class EbookReader:
         # OCR state
         self._ocr_cache: dict[str, str] = {}
         self._epub_book = None
-        self._render_id = 0  # incremented each show_chapter call; stale threads check this
+        self._render_id = 0
+
+        # TTS state — must be initialised before _build_ui() so that
+        # _build_toolbar() can call _tts_set_state() safely
+        self._tts = TTSEngine()
+        self._tts_poll_id = None
 
         self._build_ui()
         self._apply_theme()
@@ -160,6 +251,7 @@ class EbookReader:
                              relief=tk.FLAT, padx=10, pady=4,
                              font=("Helvetica", font_size), cursor="hand2")
 
+        # Navigation / display controls
         self.open_btn  = btn("Open Book",  self.open_file)
         self.prev_btn  = btn("◀ Prev",     self.prev_chapter)
         self.next_btn  = btn("Next ▶",     self.next_chapter)
@@ -171,21 +263,37 @@ class EbookReader:
                   self.fdec_btn, self.finc_btn, self.dark_btn):
             w.pack(side=tk.LEFT, padx=2)
 
-        # Chapter counter (right side)
+        # Visual separator before TTS controls
+        self.tts_sep = tk.Frame(self.toolbar, width=1, pady=2)
+        self.tts_sep.pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        # TTS controls
+        self.tts_play_btn  = btn("▶ Speak", self._tts_play)
+        self.tts_pause_btn = btn("⏸ Pause", self._tts_pause)
+        self.tts_stop_btn  = btn("⏹ Stop",  self._tts_stop)
+
+        for w in (self.tts_play_btn, self.tts_pause_btn, self.tts_stop_btn):
+            w.pack(side=tk.LEFT, padx=2)
+
+        # Right-side labels
         self.chapter_label = tk.Label(self.toolbar, text="No book open",
                                        font=("Helvetica", 11))
         self.chapter_label.pack(side=tk.RIGHT, padx=8)
 
-        # OCR status (right side, hidden until needed)
         self.ocr_status_label = tk.Label(self.toolbar, text="",
                                           font=("Helvetica", 10, "italic"))
         self.ocr_status_label.pack(side=tk.RIGHT, padx=4)
 
+        # All widgets that need bg/fg theming
         self.toolbar_widgets = [
             self.open_btn, self.prev_btn, self.next_btn,
             self.fdec_btn, self.finc_btn, self.dark_btn,
+            self.tts_play_btn, self.tts_pause_btn, self.tts_stop_btn,
             self.chapter_label,
         ]
+
+        # Start with TTS buttons disabled (no book open)
+        self._tts_set_state("no_book")
 
     def _build_panels(self):
         self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -243,6 +351,7 @@ class EbookReader:
         self.root.bind("<Command-equal>", lambda _: self.increase_font())
         self.root.bind("<Command-minus>", lambda _: self.decrease_font())
         self.root.bind("<Command-d>", lambda _: self.toggle_dark_mode())
+        self.root.bind("<Command-r>", lambda _: self._tts_play())
 
     # ── Theme ─────────────────────────────────────────────────────────────────
 
@@ -259,6 +368,7 @@ class EbookReader:
                 kw["activeforeground"] = t["fg"]
             w.config(**kw)
 
+        self.tts_sep.config(bg=t["border"])
         self.ocr_status_label.config(bg=t["toolbar_bg"], fg=t["ocr_fg"])
 
         self.left_frame.config(bg=t["toc_bg"])
@@ -335,6 +445,8 @@ class EbookReader:
     # ── EPUB loading ──────────────────────────────────────────────────────────
 
     def _load_epub(self, path):
+        self._tts.stop()
+        self._tts_cancel_poll()
         book = epub.read_epub(path)
         self._epub_book = book
         self._ocr_cache.clear()
@@ -365,10 +477,13 @@ class EbookReader:
 
         self._populate_toc()
         self.show_chapter(0)
+        self._tts_set_state("idle")
 
     # ── PDF loading ───────────────────────────────────────────────────────────
 
     def _load_pdf(self, path):
+        self._tts.stop()
+        self._tts_cancel_poll()
         if self.pdf_doc:
             self.pdf_doc.close()
         self.pdf_doc = fitz.open(path)
@@ -394,6 +509,7 @@ class EbookReader:
 
         self._populate_toc()
         self.show_chapter(0)
+        self._tts_set_state("idle")
 
     # ── Chapter display ───────────────────────────────────────────────────────
 
@@ -406,7 +522,13 @@ class EbookReader:
         if not self.chapters or not (0 <= index < len(self.chapters)):
             return
 
-        # Invalidate any in-progress background render
+        # Stop any in-progress speech when navigating chapters
+        if self._tts.is_speaking or self._tts.is_paused:
+            self._tts.stop()
+            self._tts_set_state("idle")
+            self._tts_cancel_poll()
+
+        # Invalidate any in-progress background OCR render
         self._render_id += 1
         render_id = self._render_id
 
@@ -426,7 +548,6 @@ class EbookReader:
             self.text_area.config(state=tk.DISABLED)
             self.text_area.yview_moveto(0)
         else:
-            # PDFs: render text pages synchronously, OCR image pages in background
             self.text_area.config(state=tk.DISABLED)
             self.text_area.yview_moveto(0)
             self._render_pdf_async(data, render_id)
@@ -543,16 +664,9 @@ class EbookReader:
     # ── PDF rendering (with background OCR) ──────────────────────────────────
 
     def _render_pdf_async(self, page_range, render_id):
-        """
-        Render PDF pages:
-        - Pages with embedded text → inserted immediately on the main thread.
-        - Image-only pages → OCR'd in a background thread, appended as they finish.
-        """
         start, end = page_range
         image_page_count = 0
 
-        # First pass: synchronously insert all text-bearing pages and show
-        # "Scanning…" placeholders for image pages.
         self.text_area.config(state=tk.NORMAL)
         for pn in range(start, min(end, len(self.pdf_doc))):
             text = self.pdf_doc[pn].get_text().strip()
@@ -561,7 +675,7 @@ class EbookReader:
             elif f"pdf:{pn}" in self._ocr_cache:
                 cached = self._ocr_cache[f"pdf:{pn}"]
                 if cached.strip():
-                    self._insert_ocr_block(cached)
+                    self.text_area.insert(tk.END, cached + "\n\n")
             elif OCREngine.available():
                 image_page_count += 1
                 s = self.text_area.index(tk.INSERT)
@@ -580,23 +694,21 @@ class EbookReader:
         if image_page_count == 0:
             return
 
-        # Second pass: OCR image pages in background, replace placeholders
         self._set_ocr_status(f"Recognizing text in {image_page_count} image page(s)…")
 
         def worker():
             for pn in range(start, min(end, len(self.pdf_doc))):
                 if render_id != self._render_id:
-                    return  # chapter changed — abort
+                    return
 
                 page = self.pdf_doc[pn]
                 if page.get_text().strip():
-                    continue  # already has text
+                    continue
 
                 cache_key = f"pdf:{pn}"
                 if cache_key in self._ocr_cache:
                     continue
 
-                # OCR the page
                 try:
                     from PIL import Image
                     pix = page.get_pixmap(dpi=150)
@@ -606,13 +718,11 @@ class EbookReader:
                     ocr_text = f"[OCR error on page {pn + 1}: {exc}]"
 
                 self._ocr_cache[cache_key] = ocr_text
-                pn_copy = pn
-                text_copy = ocr_text
 
                 if render_id == self._render_id:
                     self.root.after(
                         0,
-                        lambda t=text_copy, p=pn_copy: self._replace_scan_placeholder(t, p, render_id),
+                        lambda t=ocr_text, p=pn: self._replace_scan_placeholder(t, p, render_id),
                     )
 
             if render_id == self._render_id:
@@ -621,7 +731,6 @@ class EbookReader:
         threading.Thread(target=worker, daemon=True).start()
 
     def _replace_scan_placeholder(self, ocr_text, page_num, render_id):
-        """Find the 'Scanning page N…' placeholder and replace it with OCR text."""
         if render_id != self._render_id:
             return
 
@@ -630,31 +739,86 @@ class EbookReader:
 
         pos = self.text_area.search(placeholder, "1.0", tk.END)
         if pos:
-            line_end = f"{pos.split('.')[0]}.end"
-            # Delete the placeholder line (+2 trailing newlines)
             self.text_area.delete(pos, f"{pos} + {len(placeholder) + 2} chars")
             if ocr_text.strip():
-                self._insert_ocr_block_at(ocr_text, pos)
+                self.text_area.insert(pos, ocr_text + "\n\n")
             else:
                 self.text_area.insert(pos, "\n")
 
         self.text_area.config(state=tk.DISABLED)
 
-    def _insert_ocr_block(self, text):
-        start = self.text_area.index(tk.INSERT)
-        label_end = self.text_area.index(tk.INSERT)
-        self.text_area.insert(tk.END, text + "\n\n")
-
-    def _insert_ocr_block_at(self, text, pos):
-        self.text_area.insert(pos, text + "\n\n")
-
-    # ── OCR status bar ────────────────────────────────────────────────────────
+    # ── OCR status ────────────────────────────────────────────────────────────
 
     def _set_ocr_status(self, message: str):
-        """Update the OCR status label (safe to call from main thread only)."""
         self.ocr_status_label.config(text=message)
 
-    # ── Controls ──────────────────────────────────────────────────────────────
+    # ── TTS controls ──────────────────────────────────────────────────────────
+
+    def _get_readable_text(self) -> str:
+        """Return clean text from the current chapter suitable for TTS."""
+        raw = self.text_area.get("1.0", tk.END)
+        raw = re.sub(r'\[Image text\] ?', '', raw)
+        raw = re.sub(r'⟳ Scanning page \d+…\n?', '', raw)
+        raw = re.sub(r'\[Page \d+ is an image[^\]]*\]\n?', '', raw)
+        raw = re.sub(r'\[OCR error[^\]]*\]\n?', '', raw)
+        raw = re.sub(r'\n{3,}', '\n\n', raw)
+        return raw.strip()
+
+    def _tts_set_state(self, state: str):
+        """Update TTS button labels and enabled states."""
+        sp = self._tts.supports_pause
+        cfg = {
+            "no_book":  [("▶ Speak", tk.DISABLED), ("⏸ Pause",   tk.DISABLED), ("⏹ Stop",  tk.DISABLED)],
+            "idle":     [("▶ Speak", tk.NORMAL),   ("⏸ Pause",   tk.DISABLED), ("⏹ Stop",  tk.DISABLED)],
+            "speaking": [("▶ Speak", tk.DISABLED), ("⏸ Pause",   tk.NORMAL if sp else tk.DISABLED), ("⏹ Stop", tk.NORMAL)],
+            "paused":   [("▶ Speak", tk.DISABLED), ("▶ Resume",  tk.NORMAL),   ("⏹ Stop",  tk.NORMAL)],
+        }
+        (play_lbl, play_st), (pause_lbl, pause_st), (stop_lbl, stop_st) = cfg[state]
+        self.tts_play_btn.config( text=play_lbl,  state=play_st)
+        self.tts_pause_btn.config(text=pause_lbl, state=pause_st)
+        self.tts_stop_btn.config( text=stop_lbl,  state=stop_st)
+
+    def _tts_play(self):
+        if not self.chapters:
+            return
+        text = self._get_readable_text()
+        if not text:
+            return
+        self._tts.speak(text)
+        self._tts_set_state("speaking")
+        self._tts_start_poll()
+
+    def _tts_pause(self):
+        if self._tts.is_paused:
+            self._tts.resume()
+            self._tts_set_state("speaking")
+        else:
+            self._tts.pause()
+            self._tts_set_state("paused")
+
+    def _tts_stop(self):
+        self._tts.stop()
+        self._tts_set_state("idle")
+        self._tts_cancel_poll()
+
+    def _tts_start_poll(self):
+        self._tts_cancel_poll()
+        self._tts_poll_id = self.root.after(300, self._tts_poll)
+
+    def _tts_cancel_poll(self):
+        if self._tts_poll_id is not None:
+            self.root.after_cancel(self._tts_poll_id)
+            self._tts_poll_id = None
+
+    def _tts_poll(self):
+        """Detect when speech finishes naturally and reset to idle."""
+        if not self._tts.is_speaking and not self._tts.is_paused:
+            self._tts_set_state("idle")
+            self._tts_poll_id = None
+        else:
+            self._tts_poll_id = self.root.after(300, self._tts_poll)
+
+    # ── Navigation controls ───────────────────────────────────────────────────
 
     def _on_toc_select(self, _event):
         sel = self.toc_listbox.curselection()
@@ -701,27 +865,29 @@ Supported formats
   • EPUB (.epub) — used by Libby, Sora, Kobo, Project Gutenberg, and more
   • PDF  (.pdf)  — any standard PDF, including scanned documents
 
-Image & OCR support
-  Pages or images that contain no embedded text are automatically scanned
-  using Apple's Vision framework (built into macOS 10.15+). It runs on the
-  Neural Engine — typically under 1 second per page — and results are cached
-  so re-navigating a chapter is instant.
+Read Aloud
+  Click "▶ Speak" (or press ⌘R) to have the current chapter read aloud using
+  a high-quality macOS voice. Use ⏸ Pause / ▶ Resume to pause and continue,
+  and ⏹ Stop to stop. Speech stops automatically when you change chapters.
 
-  To enable OCR, run setup_and_run.sh once (it installs pyobjc automatically).
+Image & OCR
+  Scanned pages with no embedded text are recognized automatically using
+  Apple Vision (Neural Engine, ~1s per page) and included in speech.
 
 About DRM
-  Books borrowed from Libby, Sora, or Kindle are DRM-protected and can only
-  be read inside the official apps. This reader works with DRM-free ebooks
-  such as those from Project Gutenberg or your own documents.
+  Books borrowed from Libby, Sora, or Kindle are DRM-protected and must be
+  read in the official apps. This reader works with DRM-free ebooks such as
+  those from Project Gutenberg or your own documents.
 
 Getting started
-  1.  Click "Open Book" in the toolbar (or press ⌘O).
-  2.  Select an EPUB or PDF file.
-  3.  Navigate chapters via the Table of Contents on the left.
-  4.  Use A− / A+ to change font size, or ⌘= / ⌘−.
-  5.  Toggle dark mode with the ☾ button or ⌘D.
+  1.  Click "Open Book" (or press ⌘O) and select an EPUB or PDF.
+  2.  Navigate chapters via the Table of Contents on the left.
+  3.  Press ⌘R or click ▶ Speak to listen to the chapter.
+  4.  Use A− / A+ (or ⌘= / ⌘−) to adjust font size.
+  5.  Toggle dark mode with ☾ (or ⌘D).
 """)
         self.text_area.config(state=tk.DISABLED)
+        self._tts_set_state("no_book")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
