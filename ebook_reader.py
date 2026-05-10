@@ -6,8 +6,10 @@ DRM-free files only; for DRM books use the official Libby/Kindle/Sora apps.
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import io
 import os
 import sys
+import threading
 
 try:
     import ebooklib
@@ -37,6 +39,7 @@ LIGHT = {
     "select_bg": "#d6d0b8",
     "border": "#cccccc",
     "toc_header_bg": "#e4e0d6",
+    "ocr_fg": "#888877",
 }
 
 DARK = {
@@ -47,8 +50,57 @@ DARK = {
     "select_bg": "#3d3d3d",
     "border": "#444444",
     "toc_header_bg": "#2a2a2a",
+    "ocr_fg": "#888899",
 }
 
+
+# ── OCR Engine (Apple Vision) ─────────────────────────────────────────────────
+
+class OCREngine:
+    """
+    Wraps Apple Vision text recognition (macOS 10.15+).
+    Falls back gracefully when pyobjc is not installed.
+    """
+    _available = None  # None = untested, True/False = result
+
+    @classmethod
+    def available(cls) -> bool:
+        if cls._available is None:
+            try:
+                import Vision  # noqa: F401
+                import Quartz  # noqa: F401
+                cls._available = True
+            except ImportError:
+                cls._available = False
+        return cls._available
+
+    @classmethod
+    def recognize(cls, pil_image) -> str:
+        """Run OCR on a PIL Image and return the recognized text."""
+        import Vision
+        import objc
+
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        raw = buf.getvalue()
+
+        ns_data = objc.lookUpClass("NSData").dataWithBytes_length_(raw, len(raw))
+        handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(
+            ns_data, None
+        )
+        request = Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        handler.performRequests_error_([request], None)
+
+        lines = []
+        for obs in request.results() or []:
+            candidates = obs.topCandidates_(1)
+            if candidates:
+                lines.append(candidates[0].string())
+        return "\n".join(lines)
+
+
+# ── Colour themes ─────────────────────────────────────────────────────────────
 
 class EbookReader:
     def __init__(self, root):
@@ -63,6 +115,11 @@ class EbookReader:
         self.dark_mode = False
         self.pdf_doc = None
 
+        # OCR state
+        self._ocr_cache: dict[str, str] = {}
+        self._epub_book = None
+        self._render_id = 0  # incremented each show_chapter call; stale threads check this
+
         self._build_ui()
         self._apply_theme()
         self._show_welcome()
@@ -72,7 +129,7 @@ class EbookReader:
     def _build_ui(self):
         self._build_menu()
         self._build_toolbar()
-        tk.Frame(self.root, height=1).pack(fill=tk.X)  # separator line
+        tk.Frame(self.root, height=1).pack(fill=tk.X)
         self._build_panels()
         self._bind_keys()
 
@@ -99,25 +156,30 @@ class EbookReader:
         self.toolbar.pack(fill=tk.X)
 
         def btn(text, cmd, font_size=12):
-            b = tk.Button(self.toolbar, text=text, command=cmd,
-                          relief=tk.FLAT, padx=10, pady=4,
-                          font=("Helvetica", font_size), cursor="hand2")
-            return b
+            return tk.Button(self.toolbar, text=text, command=cmd,
+                             relief=tk.FLAT, padx=10, pady=4,
+                             font=("Helvetica", font_size), cursor="hand2")
 
-        self.open_btn   = btn("Open Book",  self.open_file)
-        self.prev_btn   = btn("◀ Prev",     self.prev_chapter)
-        self.next_btn   = btn("Next ▶",     self.next_chapter)
-        self.fdec_btn   = btn("A−",          self.decrease_font, 11)
-        self.finc_btn   = btn("A+",          self.increase_font, 14)
-        self.dark_btn   = btn("☾ Dark",     self.toggle_dark_mode)
+        self.open_btn  = btn("Open Book",  self.open_file)
+        self.prev_btn  = btn("◀ Prev",     self.prev_chapter)
+        self.next_btn  = btn("Next ▶",     self.next_chapter)
+        self.fdec_btn  = btn("A−",          self.decrease_font, 11)
+        self.finc_btn  = btn("A+",          self.increase_font, 14)
+        self.dark_btn  = btn("☾ Dark",     self.toggle_dark_mode)
 
         for w in (self.open_btn, self.prev_btn, self.next_btn,
                   self.fdec_btn, self.finc_btn, self.dark_btn):
             w.pack(side=tk.LEFT, padx=2)
 
+        # Chapter counter (right side)
         self.chapter_label = tk.Label(self.toolbar, text="No book open",
                                        font=("Helvetica", 11))
         self.chapter_label.pack(side=tk.RIGHT, padx=8)
+
+        # OCR status (right side, hidden until needed)
+        self.ocr_status_label = tk.Label(self.toolbar, text="",
+                                          font=("Helvetica", 10, "italic"))
+        self.ocr_status_label.pack(side=tk.RIGHT, padx=4)
 
         self.toolbar_widgets = [
             self.open_btn, self.prev_btn, self.next_btn,
@@ -197,6 +259,8 @@ class EbookReader:
                 kw["activeforeground"] = t["fg"]
             w.config(**kw)
 
+        self.ocr_status_label.config(bg=t["toolbar_bg"], fg=t["ocr_fg"])
+
         self.left_frame.config(bg=t["toc_bg"])
         self.toc_header.config(bg=t["toc_header_bg"], fg=t["fg"])
 
@@ -218,13 +282,18 @@ class EbookReader:
 
     def _configure_text_tags(self):
         fs = self.font_size
-        self.text_area.tag_configure("h1",   font=("Georgia", fs + 10, "bold"), spacing3=12)
-        self.text_area.tag_configure("h2",   font=("Georgia", fs + 6,  "bold"), spacing3=10)
-        self.text_area.tag_configure("h3",   font=("Georgia", fs + 3,  "bold"), spacing3=8)
-        self.text_area.tag_configure("bold", font=("Georgia", fs,       "bold"))
-        self.text_area.tag_configure("italic", font=("Georgia", fs,     "italic"))
+        t = DARK if self.dark_mode else LIGHT
+        self.text_area.tag_configure("h1",     font=("Georgia", fs + 10, "bold"), spacing3=12)
+        self.text_area.tag_configure("h2",     font=("Georgia", fs + 6,  "bold"), spacing3=10)
+        self.text_area.tag_configure("h3",     font=("Georgia", fs + 3,  "bold"), spacing3=8)
+        self.text_area.tag_configure("bold",   font=("Georgia", fs,       "bold"))
+        self.text_area.tag_configure("italic", font=("Georgia", fs,       "italic"))
         self.text_area.tag_configure("para",   spacing3=10)
         self.text_area.tag_configure("bullet", lmargin1=20, lmargin2=30)
+        self.text_area.tag_configure("ocr_label", font=("Helvetica", fs - 2, "italic"),
+                                      foreground=t["ocr_fg"])
+        self.text_area.tag_configure("scanning", font=("Helvetica", fs - 2, "italic"),
+                                      foreground=t["ocr_fg"])
 
     # ── File opening ──────────────────────────────────────────────────────────
 
@@ -267,6 +336,8 @@ class EbookReader:
 
     def _load_epub(self, path):
         book = epub.read_epub(path)
+        self._epub_book = book
+        self._ocr_cache.clear()
         self.chapters = []
 
         meta_title = book.get_metadata("DC", "title")
@@ -301,6 +372,7 @@ class EbookReader:
         if self.pdf_doc:
             self.pdf_doc.close()
         self.pdf_doc = fitz.open(path)
+        self._ocr_cache.clear()
         self.chapters = []
 
         title = os.path.basename(path).removesuffix(".pdf")
@@ -334,26 +406,32 @@ class EbookReader:
         if not self.chapters or not (0 <= index < len(self.chapters)):
             return
 
+        # Invalidate any in-progress background render
+        self._render_id += 1
+        render_id = self._render_id
+
         self.current_chapter = index
         kind, ch_title, data = self.chapters[index]
 
         self.toc_listbox.selection_clear(0, tk.END)
         self.toc_listbox.selection_set(index)
         self.toc_listbox.see(index)
-        self.chapter_label.config(
-            text=f"Chapter {index + 1} / {len(self.chapters)}"
-        )
+        self.chapter_label.config(text=f"Chapter {index + 1} / {len(self.chapters)}")
 
         self.text_area.config(state=tk.NORMAL)
         self.text_area.delete(1.0, tk.END)
 
         if kind == "epub":
             self._render_epub(data)
+            self.text_area.config(state=tk.DISABLED)
+            self.text_area.yview_moveto(0)
         else:
-            self._render_pdf(data)
+            # PDFs: render text pages synchronously, OCR image pages in background
+            self.text_area.config(state=tk.DISABLED)
+            self.text_area.yview_moveto(0)
+            self._render_pdf_async(data, render_id)
 
-        self.text_area.config(state=tk.DISABLED)
-        self.text_area.yview_moveto(0)
+    # ── EPUB rendering ────────────────────────────────────────────────────────
 
     def _render_epub(self, html):
         soup = BeautifulSoup(html, "html.parser")
@@ -406,8 +484,47 @@ class EbookReader:
             self.text_area.insert(tk.END, "\n    ")
             self._render_node(tag)
             self.text_area.insert(tk.END, "\n\n")
-        elif name not in ("img", "figure", "svg", "figcaption"):
+        elif name == "img":
+            self._render_epub_img(tag)
+        elif name not in ("figure", "svg", "figcaption"):
             self._render_node(tag)
+
+    def _render_epub_img(self, tag):
+        """OCR an inline EPUB image and insert the recognized text."""
+        if not self._epub_book or not OCREngine.available():
+            return
+
+        src = tag.get("src", "") or tag.get("xlink:href", "")
+        if not src:
+            return
+
+        filename = src.split("/")[-1]
+        cache_key = f"epub_img:{filename}"
+
+        if cache_key in self._ocr_cache:
+            ocr_text = self._ocr_cache[cache_key]
+        else:
+            ocr_text = ""
+            for item in self._epub_book.get_items():
+                if item.get_name().endswith(filename):
+                    try:
+                        from PIL import Image
+                        img = Image.open(io.BytesIO(item.get_content()))
+                        ocr_text = OCREngine.recognize(img)
+                        self._ocr_cache[cache_key] = ocr_text
+                    except Exception:
+                        pass
+                    break
+
+        if ocr_text.strip():
+            self.text_area.insert(tk.END, "\n")
+            start = self.text_area.index(tk.INSERT)
+            self.text_area.insert(tk.END, "[Image text] ")
+            self.text_area.tag_add("ocr_label", start, self.text_area.index(tk.INSERT))
+            start2 = self.text_area.index(tk.INSERT)
+            self.text_area.insert(tk.END, ocr_text)
+            self.text_area.tag_add("italic", start2, self.text_area.index(tk.INSERT))
+            self.text_area.insert(tk.END, "\n\n")
 
     def _tagged_block(self, text, tag_name, suffix):
         self.text_area.insert(tk.END, "\n")
@@ -423,12 +540,119 @@ class EbookReader:
         end = self.text_area.index(tk.INSERT)
         self.text_area.tag_add(tag_name, start, end)
 
-    def _render_pdf(self, page_range):
+    # ── PDF rendering (with background OCR) ──────────────────────────────────
+
+    def _render_pdf_async(self, page_range, render_id):
+        """
+        Render PDF pages:
+        - Pages with embedded text → inserted immediately on the main thread.
+        - Image-only pages → OCR'd in a background thread, appended as they finish.
+        """
         start, end = page_range
+        image_page_count = 0
+
+        # First pass: synchronously insert all text-bearing pages and show
+        # "Scanning…" placeholders for image pages.
+        self.text_area.config(state=tk.NORMAL)
         for pn in range(start, min(end, len(self.pdf_doc))):
-            text = self.pdf_doc[pn].get_text()
-            if text.strip():
-                self.text_area.insert(tk.END, text + "\n")
+            text = self.pdf_doc[pn].get_text().strip()
+            if text:
+                self.text_area.insert(tk.END, text + "\n\n")
+            elif f"pdf:{pn}" in self._ocr_cache:
+                cached = self._ocr_cache[f"pdf:{pn}"]
+                if cached.strip():
+                    self._insert_ocr_block(cached)
+            elif OCREngine.available():
+                image_page_count += 1
+                s = self.text_area.index(tk.INSERT)
+                self.text_area.insert(tk.END, f"⟳ Scanning page {pn + 1}…\n\n")
+                e = self.text_area.index(tk.INSERT)
+                self.text_area.tag_add("scanning", s, e)
+            else:
+                s = self.text_area.index(tk.INSERT)
+                self.text_area.insert(
+                    tk.END,
+                    f"[Page {pn + 1} is an image — install pyobjc for OCR]\n\n",
+                )
+                self.text_area.tag_add("ocr_label", s, self.text_area.index(tk.INSERT))
+        self.text_area.config(state=tk.DISABLED)
+
+        if image_page_count == 0:
+            return
+
+        # Second pass: OCR image pages in background, replace placeholders
+        self._set_ocr_status(f"Recognizing text in {image_page_count} image page(s)…")
+
+        def worker():
+            for pn in range(start, min(end, len(self.pdf_doc))):
+                if render_id != self._render_id:
+                    return  # chapter changed — abort
+
+                page = self.pdf_doc[pn]
+                if page.get_text().strip():
+                    continue  # already has text
+
+                cache_key = f"pdf:{pn}"
+                if cache_key in self._ocr_cache:
+                    continue
+
+                # OCR the page
+                try:
+                    from PIL import Image
+                    pix = page.get_pixmap(dpi=150)
+                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    ocr_text = OCREngine.recognize(img)
+                except Exception as exc:
+                    ocr_text = f"[OCR error on page {pn + 1}: {exc}]"
+
+                self._ocr_cache[cache_key] = ocr_text
+                pn_copy = pn
+                text_copy = ocr_text
+
+                if render_id == self._render_id:
+                    self.root.after(
+                        0,
+                        lambda t=text_copy, p=pn_copy: self._replace_scan_placeholder(t, p, render_id),
+                    )
+
+            if render_id == self._render_id:
+                self.root.after(0, lambda: self._set_ocr_status(""))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _replace_scan_placeholder(self, ocr_text, page_num, render_id):
+        """Find the 'Scanning page N…' placeholder and replace it with OCR text."""
+        if render_id != self._render_id:
+            return
+
+        placeholder = f"⟳ Scanning page {page_num + 1}…"
+        self.text_area.config(state=tk.NORMAL)
+
+        pos = self.text_area.search(placeholder, "1.0", tk.END)
+        if pos:
+            line_end = f"{pos.split('.')[0]}.end"
+            # Delete the placeholder line (+2 trailing newlines)
+            self.text_area.delete(pos, f"{pos} + {len(placeholder) + 2} chars")
+            if ocr_text.strip():
+                self._insert_ocr_block_at(ocr_text, pos)
+            else:
+                self.text_area.insert(pos, "\n")
+
+        self.text_area.config(state=tk.DISABLED)
+
+    def _insert_ocr_block(self, text):
+        start = self.text_area.index(tk.INSERT)
+        label_end = self.text_area.index(tk.INSERT)
+        self.text_area.insert(tk.END, text + "\n\n")
+
+    def _insert_ocr_block_at(self, text, pos):
+        self.text_area.insert(pos, text + "\n\n")
+
+    # ── OCR status bar ────────────────────────────────────────────────────────
+
+    def _set_ocr_status(self, message: str):
+        """Update the OCR status label (safe to call from main thread only)."""
+        self.ocr_status_label.config(text=message)
 
     # ── Controls ──────────────────────────────────────────────────────────────
 
@@ -475,13 +699,20 @@ Open an EPUB or PDF file to start reading.
 
 Supported formats
   • EPUB (.epub) — used by Libby, Sora, Kobo, Project Gutenberg, and more
-  • PDF  (.pdf)  — any standard PDF document
+  • PDF  (.pdf)  — any standard PDF, including scanned documents
+
+Image & OCR support
+  Pages or images that contain no embedded text are automatically scanned
+  using Apple's Vision framework (built into macOS 10.15+). It runs on the
+  Neural Engine — typically under 1 second per page — and results are cached
+  so re-navigating a chapter is instant.
+
+  To enable OCR, run setup_and_run.sh once (it installs pyobjc automatically).
 
 About DRM
-Books borrowed from Libby, Sora, or Kindle are DRM-protected and can only
-be read inside the official apps. This reader works with DRM-free ebooks
-such as those purchased without DRM, downloaded from Project Gutenberg, or
-your own personal documents.
+  Books borrowed from Libby, Sora, or Kindle are DRM-protected and can only
+  be read inside the official apps. This reader works with DRM-free ebooks
+  such as those from Project Gutenberg or your own documents.
 
 Getting started
   1.  Click "Open Book" in the toolbar (or press ⌘O).
@@ -498,7 +729,6 @@ Getting started
 def main():
     root = tk.Tk()
 
-    # Improve sharpness on Retina displays
     try:
         root.tk.call("tk", "scaling", 2.0)
     except Exception:

@@ -42,6 +42,10 @@ FEATURES
 ────────────────────────────────────────────────────────────────────────────────
 
 • Open EPUB and PDF files
+• Automatic OCR for scanned/image-only pages using Apple Vision (built-in macOS)
+• OCR for images embedded inside EPUB files
+• Background OCR — UI stays responsive while pages are scanned
+• OCR result caching — re-navigating a chapter is instant (no re-scanning)
 • Table of Contents panel with chapter navigation
 • Previous / Next chapter buttons
 • Adjustable font size (A− / A+ or ⌘= / ⌘−)
@@ -53,6 +57,28 @@ FEATURES
     ⌘=  Increase font size
     ⌘−  Decrease font size
     ⌘Q  Quit
+
+────────────────────────────────────────────────────────────────────────────────
+OCR (IMAGE TEXT RECOGNITION)
+────────────────────────────────────────────────────────────────────────────────
+
+The app uses Apple's Vision framework — the same engine behind macOS's "Live
+Text" feature — to read text from images automatically.
+
+How it works:
+  • Normal PDFs with embedded text: displayed instantly, no OCR needed.
+  • Scanned PDFs (image-only pages): the app shows "⟳ Scanning page N…" then
+    replaces each placeholder with the recognized text as it finishes.
+  • EPUBs with images containing text: recognized text appears below the image
+    in italic, labeled "[Image text]".
+
+Speed: Apple Vision uses the Mac's Neural Engine, not the CPU, so a typical
+page processes in under 1 second. Results are cached so revisiting a chapter
+is instant.
+
+Requirements: pyobjc (installed automatically by setup_and_run.sh).
+Without pyobjc, the app still works for text-based files — image pages just
+show a "[install pyobjc for OCR]" note.
 
 ────────────────────────────────────────────────────────────────────────────────
 ABOUT DRM

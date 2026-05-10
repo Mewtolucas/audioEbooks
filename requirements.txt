@@ -3,3 +3,8 @@ beautifulsoup4>=4.12
 lxml>=4.9
 PyMuPDF>=1.23
 Pillow>=10.0
+
+# Apple Vision OCR (macOS 10.15+) — hardware-accelerated, under 1s per page
+pyobjc-framework-Vision>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-core>=10.0; sys_platform == "darwin"
