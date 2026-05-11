@@ -16,23 +16,19 @@ jobs:
 
       - name: Create EbookReader.zip
         run: |
-          mkdir EbookReader
+          mkdir -p EbookReader
           cp ebook_reader.py requirements.txt setup_and_run.sh build_app.sh README.md EbookReader/
           chmod +x EbookReader/setup_and_run.sh EbookReader/build_app.sh
           zip -r EbookReader.zip EbookReader/
 
-      - name: Delete existing "latest" release
+      - name: Publish or update release
         run: |
-          gh release delete latest --yes 2>/dev/null || true
-          git push --delete origin latest 2>/dev/null || true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish release with zip
-        run: |
-          gh release create latest EbookReader.zip \
-            --title "Ebook Reader — Latest" \
-            --notes "## How to install
+          if gh release view latest &>/dev/null; then
+            gh release upload latest EbookReader.zip --clobber
+          else
+            gh release create latest EbookReader.zip \
+              --title "Ebook Reader — Latest" \
+              --notes "## How to install
 
           1. Click **EbookReader.zip** below to download
           2. Unzip it (double-click the zip file)
@@ -41,5 +37,6 @@ jobs:
 
           **Requirements:** macOS 10.15+, Python 3.9+
           ([python.org](https://python.org) or \`brew install python3\`)"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
